@@ -37,6 +37,7 @@
 | 还原原版 | 使用当前安装、当前版本的有效备份恢复原文件 |
 | 打开 Cursor | 启动当前选中的 Cursor |
 | 查看备份 | 打开本机备份、清单和日志目录 |
+| 删除备份 | 统计并确认后删除历史备份，保留当前版本还原所需的备份 |
 
 进度对应实际检查、备份、语法检查、写入和校验阶段；失败时会显示错误，不会显示为注入完成。
 
@@ -57,12 +58,20 @@
 备份和日志保存在目标电脑的：
 
 ```text
-%LOCALAPPDATA%\CursorZhCNPortable\<安装路径标识>\
+%USERPROFILE%\CursorZhCNPortable\<安装路径标识>\
 ```
 
 每个 Cursor 安装路径使用独立的数据目录，备份按版本保存。移动便携工具文件夹不会移动或删除这些备份。工具包不包含作者电脑的日志、备份、账户信息或 Cursor 原始程序资源。
 
 请保留本机备份，直到确定不再需要还原。还原会核对安装目录、版本和文件哈希，拒绝用另一台电脑或旧版本的记录覆盖当前安装。
+
+点击「查看备份」会直接打开所选 Cursor 的本机数据目录；目录不存在时自动创建。尚未注入时可能只有日志，原文件备份会在注入时生成于 `backups` 子目录。
+
+例如 `C:\Users\你的用户名\CursorZhCNPortable\<安装路径标识>\`。默认路径直接位于用户目录，不经过其他应用的缓存层级。
+
+新版首次检查状态时，会尝试从旧版数据目录中迁移可验证的当前版本备份，并重写新清单中的备份路径。原有文件作为迁移来源保留；此后的备份、日志和清理均使用新目录。无法验证的记录不会迁移。
+
+点击「删除备份」会先统计历史备份的数量和大小，再弹出确认框。取消不会删除任何文件。确认后仅清理未被当前备份清单引用的历史备份目录，保留当前还原所需的备份、日志和清单；如果只有当前备份，会提示没有可删除的历史备份。目录链接、未知清单或跨安装记录会停止清理，其他 Cursor 安装的数据不受影响。
 
 ## 常见问题
 
@@ -106,6 +115,8 @@ resources/app/product.json
 
 在 Windows PowerShell 中，于仓库根目录执行：
 
+构建前请关闭输出目录里的工具窗口，避免正在运行的 EXE 被占用；也可通过 `-OutputDirectory` 指定新的输出目录。
+
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\cursor-zh-cn\build-portable.ps1
 ```
@@ -145,7 +156,7 @@ node --test .\cursor-zh-cn\portable.test.cjs
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\dist\Cursor中文注入工具\CursorZhCN.ps1" -Headless -Action status -CursorPath "C:\Apps\Cursor\Cursor.exe"
 ```
 
-`-Action` 可选 `status`、`apply`、`restore`；省略 `-StateDirectory` 时使用正常的本机数据目录。
+`-Action` 可选 `status`、`apply`、`restore`、`cleanup-preview`、`cleanup`；省略 `-StateDirectory` 时使用正常的本机数据目录。命令行的 `cleanup` 会直接执行历史备份清理，不弹出窗口确认，建议先用 `cleanup-preview` 查看统计。
 
 ### 主要源码
 
@@ -156,6 +167,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\dist\Cursor中文注�
 | `cursor-zh-cn/portable-runner.cjs` | 操作协议、并发锁和备份归属检查 |
 | `cursor-zh-cn/patch.cjs` | 备份、注入、校验和还原 |
 | `cursor-zh-cn/compatibility.cjs` | 应用身份与资源结构检查 |
+| `cursor-zh-cn/backup-cleanup.cjs` | 历史备份统计、当前备份保留与删除路径检查 |
 | `cursor-zh-cn/agents-overlay.js` | 显示层翻译与受保护内容过滤 |
 | `cursor-zh-cn/translations-extra.json` | 补充界面词典 |
 | `cursor-zh-cn/translations-languagepack.json` | 从官方语言包提取的翻译词典 |

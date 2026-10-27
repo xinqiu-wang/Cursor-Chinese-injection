@@ -2,6 +2,7 @@
 /cursor-zh-cn/*
 !/cursor-zh-cn/agents-overlay.js
 !/cursor-zh-cn/build-portable.ps1
+!/cursor-zh-cn/backup-cleanup.cjs
 !/cursor-zh-cn/compatibility.cjs
 !/cursor-zh-cn/overlay.test.cjs
 !/cursor-zh-cn/patch.cjs

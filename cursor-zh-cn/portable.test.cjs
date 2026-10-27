@@ -7,7 +7,7 @@ const os=require('node:os');
 const cp=require('node:child_process');
 const crypto=require('node:crypto');
 const roots=[];
-const payload=path.resolve(__dirname,'../dist/Cursor中文注入工具/payload');
+const payload=process.env.CURSOR_ZH_TEST_PAYLOAD || path.resolve(__dirname,'../dist/Cursor中文注入工具/payload');
 const checksum=value=>crypto.createHash('sha256').update(value).digest('base64').replace(/=+$/,'');
 function fixture(version='3.28.1',desktopOnly=false){
   const base=fs.mkdtempSync(path.join(os.tmpdir(),'cursor-zh-portable-test-'));roots.push(base);
@@ -22,7 +22,7 @@ function fixture(version='3.28.1',desktopOnly=false){
 }
 function run(f,action,success=true,runner=path.join(payload,'portable-runner.cjs')){
   const request=path.join(f.base,'任务 请求.json');fs.writeFileSync(request,JSON.stringify({action,appRoot:f.root,stateDir:f.state}));
-  const result=cp.spawnSync(process.execPath,[runner,request],{encoding:'utf8',windowsHide:true,timeout:30000});
+  const result=cp.spawnSync(process.execPath,[runner,request],{env:{...process.env,...f.env},encoding:'utf8',windowsHide:true,timeout:30000});
   if(success)assert.equal(result.status,0,result.stderr||result.stdout);else assert.notEqual(result.status,0);
   const lines=result.stdout.trim().split(/\r?\n/).filter(Boolean).map(line=>JSON.parse(line));
   return{...result,lines,result:lines.findLast(line=>line.type==='result')};
@@ -61,6 +61,101 @@ test('unknown patched files without valid backups are preserved',()=>{
 test('classic desktop-only install is supported without fabricating an Agents file',()=>{
   const f=fixture('2.5.0',true);run(f,'apply');const result=run(f,'status');assert.equal(result.result.targets.length,2);run(f,'restore');verifyOriginal(f);
 });
+test('cleanup preview does not delete; cleanup removes old generations and keeps current restore usable',()=>{
+  const f=fixture();run(f,'apply');
+  const old=JSON.parse(fs.readFileSync(path.join(f.state,'manifest.json'),'utf8'));
+  for(const[name,source]of Object.entries(f.original))fs.writeFileSync(path.join(f.root,'out/vs/workbench',name),source);
+  const product=JSON.parse(fs.readFileSync(old.targets.find(row=>row.target.endsWith('product.json')).backup,'utf8'));
+  product.version='4.0.0';product.commit='new-generation';fs.writeFileSync(path.join(f.root,'product.json'),JSON.stringify(product));
+  run(f,'apply');
+  const current=JSON.parse(fs.readFileSync(path.join(f.state,'manifest.json'),'utf8'));
+  const preview=run(f,'cleanup-preview').result;
+  assert.equal(preview.removableCount,1);assert.equal(preview.retainedCount,1);assert.ok(preview.removableBytes>0);
+  assert.ok(old.targets.every(row=>fs.existsSync(row.backup)),'Preview must not delete');
+  const cleaned=run(f,'cleanup').result;assert.equal(cleaned.deletedCount,1);assert.equal(cleaned.retainedCount,1);
+  assert.ok(old.targets.every(row=>!fs.existsSync(row.backup)));
+  assert.ok(current.targets.every(row=>fs.existsSync(row.backup)));
+  assert.equal(run(f,'cleanup-preview').result.removableCount,0);
+  run(f,'restore');verifyOriginal(f);
+});
+
+test('cleanup without a manifest preserves untracked backups',()=>{
+  const f=fixture();const backup=path.join(f.state,'backups','3.26.0-history','original.js');
+  fs.mkdirSync(path.dirname(backup),{recursive:true});fs.writeFileSync(backup,'keep');
+  const failed=run(f,'cleanup',false);assert.match(failed.stdout,/没有有效的当前备份清单/);assert.equal(fs.readFileSync(backup,'utf8'),'keep');
+});
+
+test('cleanup refuses linked directories and never follows them outside the backup root',()=>{
+  const f=fixture();run(f,'apply');
+  const outside=path.join(f.base,'unrelated-data');fs.mkdirSync(outside);fs.writeFileSync(path.join(outside,'keep.txt'),'keep');
+  const history=path.join(f.state,'backups','3.26.0-history');fs.mkdirSync(history);
+  fs.symlinkSync(outside,path.join(history,'escape'),process.platform==='win32'?'junction':'dir');
+  const failed=run(f,'cleanup',false);assert.match(failed.stdout,/链接/);
+  assert.equal(fs.readFileSync(path.join(outside,'keep.txt'),'utf8'),'keep');assert.ok(fs.existsSync(history));
+});
+
+test('cleanup rejects backup records belonging to a different installation',()=>{
+  const a=fixture(),b=fixture();run(a,'apply');
+  fs.mkdirSync(b.state,{recursive:true});fs.copyFileSync(path.join(a.state,'manifest.json'),path.join(b.state,'manifest.json'));
+  assert.match(run(b,'cleanup',false).stdout,/另一个安装目录/);verifyOriginal(b);
+});
+
+test('backup folder opener creates Unicode and spaced paths and passes an unquoted folder to the shell', {skip:process.platform!=='win32'},()=>{
+  const f=fixture();const folder=path.join(f.base,'查看备份 中文 空格','new-folder');
+  const script=path.join(__dirname,'portable','CursorZhCN.ps1');
+  const command=`$ErrorActionPreference='Stop'; $tokens=$null; $errors=$null
+$tree=[Management.Automation.Language.Parser]::ParseFile($env:CURSOR_ZH_TEST_SCRIPT,[ref]$tokens,[ref]$errors)
+if($errors.Count){throw ($errors|Out-String)}
+foreach($name in @('Resolve-PhysicalDirectoryPath','Show-BackupDirectory')){
+  $function=$tree.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)
+  Invoke-Expression $function.Extent.Text
+}
+$script:opened=$null
+function Start-Process { param([string]$FilePath,[string]$ErrorAction) $script:opened=$FilePath }
+$result=Show-BackupDirectory $env:CURSOR_ZH_TEST_FOLDER
+if(-not [IO.Directory]::Exists($result)){throw 'Directory was not created'}
+if($script:opened -cne $result){throw 'Shell received a different path'}
+if([IO.Path]::GetFileName($result.TrimEnd([char]92)) -ne 'new-folder'){throw 'Shell received the wrong folder'}
+if($script:opened.Contains([char]34)){throw 'Shell path contains quotes'}
+`;
+  const result=cp.spawnSync('powershell.exe',['-NoProfile','-EncodedCommand',Buffer.from(command,'utf16le').toString('base64')],{env:{...process.env,CURSOR_ZH_TEST_SCRIPT:script,CURSOR_ZH_TEST_FOLDER:folder+path.sep},encoding:'utf8',windowsHide:true,timeout:30000});
+  assert.equal(result.status,0,result.stderr||result.stdout);
+});
+
+test('status migrates verified current backups from redirected legacy storage to independent user data',()=>{
+  const f=fixture();const local=path.join(f.base,'AppData','Local');
+  const identity=crypto.createHash('sha256').update(path.resolve(f.root,'../..','Cursor.exe').toLowerCase()).digest('hex').slice(0,20);
+  const oldState=path.join(local,'Packages','Sample.Packaged.App','LocalCache','Local','CursorZhCNPortable',identity);
+  const seeded=cp.spawnSync(process.execPath,[path.join(payload,'patch.cjs'),'apply'],{env:{...process.env,CURSOR_ZH_APP_ROOT:f.root,CURSOR_ZH_STATE_DIR:oldState},encoding:'utf8',windowsHide:true});
+  assert.equal(seeded.status,0,seeded.stderr);
+  const oldManifest=JSON.parse(fs.readFileSync(path.join(oldState,'manifest.json'),'utf8'));
+  // The old manifest can record the virtual path that Explorer could not access.
+  for(const row of oldManifest.targets)row.backup=path.join(local,'CursorZhCNPortable',identity,path.relative(oldState,row.backup));
+  fs.writeFileSync(path.join(oldState,'manifest.json'),JSON.stringify(oldManifest));
+  f.env={LOCALAPPDATA:local};const result=run(f,'status');assert.equal(result.result.state,'applied');
+  assert.match(result.stdout,/迁移到用户目录/);
+  const migrated=JSON.parse(fs.readFileSync(path.join(f.state,'manifest.json'),'utf8'));
+  assert.ok(migrated.targets.every(row=>row.backup.startsWith(f.state)&&fs.existsSync(row.backup)));
+  run(f,'restore');verifyOriginal(f);
+});
+
+test('default backup path is directly under the user profile and contains no application cache levels', {skip:process.platform!=='win32'},()=>{
+  const script=path.join(__dirname,'portable','CursorZhCN.ps1');
+  const command=`$ErrorActionPreference='Stop';$tokens=$null;$errors=$null
+$tree=[Management.Automation.Language.Parser]::ParseFile($env:CURSOR_ZH_TEST_SCRIPT,[ref]$tokens,[ref]$errors)
+if($errors.Count){throw ($errors|Out-String)}
+$function=$tree.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-InstallStateDirectory'},$true)
+Invoke-Expression $function.Extent.Text
+$StateDirectory=$null
+$directory=Get-InstallStateDirectory 'C:\\Apps\\Cursor\\Cursor.exe'
+$expected=Join-Path ([Environment]::GetFolderPath('UserProfile')) 'CursorZhCNPortable'
+if([IO.Path]::GetDirectoryName($directory) -ne $expected){throw 'Backup path is not directly under user profile'}
+if($directory -match 'OpenAI|ChatGPT|LocalCache|Packages'){throw 'Backup path contains unwanted app hierarchy'}
+`;
+  const result=cp.spawnSync('powershell.exe',['-NoProfile','-EncodedCommand',Buffer.from(command,'utf16le').toString('base64')],{env:{...process.env,CURSOR_ZH_TEST_SCRIPT:script},encoding:'utf8',windowsHide:true,timeout:30000});
+  assert.equal(result.status,0,result.stderr||result.stdout);
+});
+
 test('failure never emits completed progress and leaves vendor resources intact',()=>{
   const f=fixture();const metadata=JSON.parse(fs.readFileSync(path.join(f.root,'product.json'),'utf8'));
   metadata.checksums['vs/workbench/workbench.desktop.main.js']='unexpected';fs.writeFileSync(path.join(f.root,'product.json'),JSON.stringify(metadata));

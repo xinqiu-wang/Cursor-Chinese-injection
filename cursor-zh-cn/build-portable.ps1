@@ -1,4 +1,4 @@
-param([string]$OutputDirectory)
+﻿param([string]$OutputDirectory)
 $ErrorActionPreference = 'Stop'
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path (Split-Path -Parent $PSScriptRoot) 'dist' }
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
@@ -20,7 +20,7 @@ foreach ($name in @('CursorZhCN.ps1','启动工具.vbs','启动工具.cmd','使�
   else { Copy-Item -LiteralPath $source -Destination $destination -Force }
   $files.Add($name)
 }
-foreach ($name in @('patch.cjs','compatibility.cjs','portable-runner.cjs','agents-overlay.js','translations-extra.json','translations-languagepack.json')) {
+foreach ($name in @('patch.cjs','compatibility.cjs','backup-cleanup.cjs','portable-runner.cjs','agents-overlay.js','translations-extra.json','translations-languagepack.json')) {
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path (Join-Path $packageRoot 'payload') $name) -Force
   $files.Add('payload/'+$name)
 }

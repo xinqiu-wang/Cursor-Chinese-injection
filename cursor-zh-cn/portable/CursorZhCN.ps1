@@ -1,6 +1,6 @@
-param(
+﻿param(
   [switch]$Headless,
-  [ValidateSet('status','apply','restore')][string]$Action = 'status',
+  [ValidateSet('status','apply','restore','cleanup-preview','cleanup')][string]$Action = 'status',
   [string]$CursorPath,
   [string]$StateDirectory
 )
@@ -68,7 +68,7 @@ function Get-InstallStateDirectory([string]$Executable) {
   $algorithm = [Security.Cryptography.SHA256]::Create()
   try { $digest = $algorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($Executable.ToLowerInvariant())) } finally { $algorithm.Dispose() }
   $identity = [BitConverter]::ToString($digest).Replace('-','').Substring(0,20).ToLowerInvariant()
-  return Join-Path (Join-Path $env:LOCALAPPDATA 'CursorZhCNPortable') $identity
+  return Join-Path (Join-Path ([Environment]::GetFolderPath('UserProfile')) 'CursorZhCNPortable') $identity
 }
 
 function Quote-WindowsArgument([string]$Value) {
@@ -85,6 +85,51 @@ function Quote-WindowsArgument([string]$Value) {
   if ($slashes) { [void]$quoted.Append(('\' * ($slashes * 2))) }
   [void]$quoted.Append('"')
   return $quoted.ToString()
+}
+
+function Resolve-PhysicalDirectoryPath([string]$Directory) {
+  # Packaged parent apps can redirect AppData. Explorer needs the actual filesystem path.
+  if (-not ('CursorZhCN.NativeDirectoryPath' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+namespace CursorZhCN {
+  public static class NativeDirectoryPath {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder path, uint length, uint flags);
+    public static string Resolve(string directory) {
+      using (SafeFileHandle handle=CreateFileW(directory,0,7,IntPtr.Zero,3,0x02000000,IntPtr.Zero)) {
+        if(handle.IsInvalid)throw new Win32Exception(Marshal.GetLastWin32Error());
+        StringBuilder buffer=new StringBuilder(1024);
+        uint count=GetFinalPathNameByHandleW(handle,buffer,(uint)buffer.Capacity,0);
+        if(count==0)throw new Win32Exception(Marshal.GetLastWin32Error());
+        if(count>=buffer.Capacity){buffer.Capacity=checked((int)count+1);count=GetFinalPathNameByHandleW(handle,buffer,(uint)buffer.Capacity,0);}
+        if(count==0 || count>=buffer.Capacity)throw new Win32Exception(Marshal.GetLastWin32Error());
+        string path=buffer.ToString();
+        if(path.StartsWith(@"\\?\UNC\",StringComparison.OrdinalIgnoreCase))return @"\\"+path.Substring(8);
+        return path.StartsWith(@"\\?\",StringComparison.Ordinal)?path.Substring(4):path;
+      }
+    }
+  }
+}
+'@
+  }
+  return [CursorZhCN.NativeDirectoryPath]::Resolve($Directory)
+}
+
+function Show-BackupDirectory([string]$Directory) {
+  if ([string]::IsNullOrWhiteSpace($Directory)) { throw '尚未确定本机备份目录，请先选择 Cursor。' }
+  $folder = [IO.Path]::GetFullPath($Directory)
+  [void][IO.Directory]::CreateDirectory($folder)
+  $folder = Resolve-PhysicalDirectoryPath $folder
+  # Let the Windows shell open a directory directly; do not pass quoted paths to Explorer.
+  Start-Process -FilePath $folder -ErrorAction Stop
+  return $folder
 }
 
 function New-BackendProcess([string]$Executable,[string]$Operation) {
@@ -174,15 +219,16 @@ $progressTitle=New-UiLabel $form '阶段进度' 24 304 860 23 10
 $progressBar=[Windows.Forms.ProgressBar]::new();$progressBar.Location=[Drawing.Point]::new(24,334);$progressBar.Size=[Drawing.Size]::new(872,17);$progressBar.Anchor='Top,Left,Right';$progressBar.Minimum=0;$progressBar.Maximum=100;$form.Controls.Add($progressBar)
 $phaseLabel=New-UiLabel $form '就绪' 24 361 870 24 9
 $phaseLabel.ForeColor=$colors.Muted
-$applyButton=New-UiButton $form '一键注入中文' 24 397 190 38 $true
-$restoreButton=New-UiButton $form '还原原版' 226 397 150 38
-$checkButton=New-UiButton $form '检查状态' 388 397 150 38
-$openButton=New-UiButton $form '打开 Cursor' 550 397 166 38
-$backupButton=New-UiButton $form '查看备份' 728 397 168 38
+$applyButton=New-UiButton $form '一键注入中文' 24 397 170 38 $true
+$restoreButton=New-UiButton $form '还原原版' 206 397 130 38
+$checkButton=New-UiButton $form '检查状态' 348 397 130 38
+$openButton=New-UiButton $form '打开 Cursor' 490 397 130 38
+$backupButton=New-UiButton $form '查看备份' 632 397 126 38
+$deleteBackupButton=New-UiButton $form '删除备份' 770 397 126 38
 $logBox=[Windows.Forms.TextBox]::new();$logBox.Location=[Drawing.Point]::new(24,452);$logBox.Size=[Drawing.Size]::new(872,143);$logBox.Anchor='Top,Bottom,Left,Right';$logBox.Multiline=$true;$logBox.ReadOnly=$true;$logBox.ScrollBars='Vertical';$logBox.BorderStyle='FixedSingle';$logBox.BackColor=$colors.Panel;$logBox.ForeColor=$colors.Text;$logBox.Font=[Drawing.Font]::new('Microsoft YaHei UI',8.5);$form.Controls.Add($logBox)
 $footer=New-UiLabel $form '备份和日志保存在本机。注入或还原完成后，重新打开 Cursor 生效。' 24 613 872 24 9
 $footer.Anchor='Bottom,Left,Right';$footer.ForeColor=$colors.Muted
-$controlsToLock=@($pathBox,$browseButton,$detectButton,$applyButton,$restoreButton,$checkButton,$openButton,$backupButton)
+$controlsToLock=@($pathBox,$browseButton,$detectButton,$applyButton,$restoreButton,$checkButton,$openButton,$backupButton,$deleteBackupButton)
 
 function Add-UiLog([string]$Message) {
   $line='['+(Get-Date -Format 'HH:mm:ss')+'] '+$Message
@@ -203,7 +249,7 @@ function Start-UiOperation([string]$Operation){
     $backend=New-BackendProcess $exe $Operation
     $script:lastStateDirectory=$backend.StateDir
     $script:active=@{Backend=$backend;OutputTask=$backend.Process.StandardOutput.ReadLineAsync();ErrorTask=$backend.Process.StandardError.ReadLineAsync();OutputEnded=$false;ErrorEnded=$false;Errors=[Collections.Generic.List[string]]::new();Result=$null;Failure=$null}
-    Set-UiBusy $true;$progressBar.Value=0;$statusLabel.ForeColor=$colors.Blue;$statusLabel.Text=@{status='正在检查状态';apply='正在注入中文';restore='正在还原原版'}[$Operation];$detailLabel.Text='正在检查安装位置和本机备份，请等待操作完成。';$phaseLabel.Text='0% · 任务已启动';Add-UiLog $statusLabel.Text
+    Set-UiBusy $true;$progressBar.Value=0;$statusLabel.ForeColor=$colors.Blue;$statusLabel.Text=@{status='正在检查状态';apply='正在注入中文';restore='正在还原原版';'cleanup-preview'='正在统计历史备份';cleanup='正在删除历史备份'}[$Operation];$detailLabel.Text='正在检查安装位置和本机备份，请等待操作完成。';$phaseLabel.Text='0% · 任务已启动';Add-UiLog $statusLabel.Text
   }catch{$statusLabel.Text='无法开始操作';$statusLabel.ForeColor=$colors.Red;$detailLabel.Text=$_.Exception.Message;Add-UiLog $_.Exception.Message;Set-UiBusy $false}
 }
 function Handle-BackendLine([string]$Line){
@@ -224,6 +270,24 @@ function Finish-UiOperation {
   }
   $script:lastResult=$active.Result;$progressBar.Value=100
   $versionLabel.Text='版本 '+$active.Result.installedVersion+'  ·  '+$active.Backend.Executable
+  if($operation -eq 'cleanup-preview'){
+    $count=[int]$active.Result.removableCount
+    $statusLabel.Text='历史备份统计完成';$statusLabel.ForeColor=$colors.Blue
+    $detailLabel.Text='可删除 '+$count+' 组历史备份；当前还原所需的 '+$active.Result.retainedCount+' 组备份会保留。'
+    $phaseLabel.Text='100% · '+$detailLabel.Text;Add-UiLog $detailLabel.Text
+    if($count -gt 0){
+      $size='{0:N2}' -f ([double]$active.Result.removableBytes/1MB)
+      $message='将删除 '+$count+' 组历史备份，约 '+$size+' MB。'+[Environment]::NewLine+'当前版本还原所需的备份会保留，Cursor 程序和中文界面不受影响。'+[Environment]::NewLine+[Environment]::NewLine+'删除后无法撤销，是否继续？'
+      if([Windows.Forms.MessageBox]::Show($form,$message,'删除历史备份',[Windows.Forms.MessageBoxButtons]::YesNo,[Windows.Forms.MessageBoxIcon]::Warning,[Windows.Forms.MessageBoxDefaultButton]::Button2) -eq 'Yes'){Start-UiOperation 'cleanup'}
+      else{Add-UiLog '已取消删除备份。'}
+    }else{Add-UiLog '没有可删除的历史备份；当前还原备份已保留。'}
+    return
+  }
+  if($operation -eq 'cleanup'){
+    $statusLabel.Text='历史备份清理完成';$statusLabel.ForeColor=$colors.Green
+    $detailLabel.Text='已删除 '+$active.Result.deletedCount+' 组历史备份；保留 '+$active.Result.retainedCount+' 组当前还原备份。'
+    $phaseLabel.Text='100% · '+$detailLabel.Text;Add-UiLog $detailLabel.Text;return
+  }
   if($operation -eq 'restore'){$statusLabel.Text='已还原原版';$detailLabel.Text='原始资源校验通过。重新打开 Cursor 生效。';$statusLabel.ForeColor=$colors.Green}
   elseif($operation -eq 'apply'){$statusLabel.Text=$(if($active.Result.unchanged){'已注入，无需重复操作'}else{'中文注入成功'});$detailLabel.Text='资源与备份校验通过。重新打开 Cursor 生效。';$statusLabel.ForeColor=$colors.Green}
   else{
@@ -256,7 +320,16 @@ $detectButton.Add_Click({$found=@(Find-CursorInstallations);$pathBox.Items.Clear
 $pathBox.Add_SelectionChangeCommitted({Update-QuickVersion;Start-UiOperation 'status'})
 $pathBox.Add_Leave({if(-not $script:active){Update-QuickVersion}})
 $openButton.Add_Click({$exe=Resolve-CursorExecutable $pathBox.Text;if($exe){Start-Process -FilePath $exe;Add-UiLog '已打开 Cursor；若当前已运行，请退出后再打开以加载新资源。'}})
-$backupButton.Add_Click({if($script:lastStateDirectory){[void][IO.Directory]::CreateDirectory($script:lastStateDirectory);Start-Process -FilePath 'explorer.exe' -ArgumentList (Quote-WindowsArgument $script:lastStateDirectory)}})
+$backupButton.Add_Click({
+  try{
+    $exe=Resolve-CursorExecutable $pathBox.Text
+    $directory=if($exe){Get-InstallStateDirectory $exe}else{Join-Path ([Environment]::GetFolderPath('UserProfile')) 'CursorZhCNPortable'}
+    $opened=Show-BackupDirectory $directory
+    Add-UiLog ('已打开备份与日志目录：'+$opened)
+    if(-not (Test-Path -LiteralPath (Join-Path $opened 'backups'))){Add-UiLog '当前目录尚无原文件备份；首次注入成功后会生成 backups 文件夹。'}
+  }catch{$statusLabel.Text='无法打开备份目录';$statusLabel.ForeColor=$colors.Red;Add-UiLog $_.Exception.Message}
+})
+$deleteBackupButton.Add_Click({Start-UiOperation 'cleanup-preview'})
 $form.Add_FormClosing({param($sender,$eventArgs)if($script:active){$eventArgs.Cancel=$true;[void][Windows.Forms.MessageBox]::Show($form,'操作正在进行，请等待完成后再关闭。','Cursor 中文注入工具',[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Information)}})
 $form.Add_Shown({Add-UiLog '工具已启动。所有处理均在本机完成。';if($CursorPath){$pathBox.Text=$CursorPath;Update-QuickVersion;Start-UiOperation 'status'}else{$detectButton.PerformClick()}})
 try{[void]$form.ShowDialog()}finally{$timer.Stop();$timer.Dispose();$form.Dispose()}

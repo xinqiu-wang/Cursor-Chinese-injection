@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const cp = require('node:child_process');
 const readline = require('node:readline');
 const {validateProduct}=require('./compatibility.cjs');
+const {planCleanup,cleanupBackups}=require('./backup-cleanup.cjs');
 const hash=data=>crypto.createHash('sha256').update(data).digest('hex');
 const emit=data=>console.log(JSON.stringify(data));
 function readJson(file){try{return JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,''));}catch{return null;}}
@@ -12,7 +13,7 @@ const normal=file=>path.resolve(file).toLowerCase();
 function inspectManifest(file,root,product){
   const manifest=readJson(file);
   if(!manifest || manifest.version!==product.version || (manifest.productCommit && manifest.productCommit!==product.commit))return null;
-  const records=manifest.targets || (manifest.target?[manifest]:[]);
+  const records=(manifest.targets || (manifest.target?[manifest]:[])).map(record=>({...record}));
   const expected=['out/vs/workbench/workbench.glass.main.js','out/vs/workbench/workbench.desktop.main.js','product.json'].map(name=>normal(path.join(root,name)));
   if(!records.length || !records.every(record=>expected.includes(normal(record.target))))return null;
   const seen=new Set();
@@ -21,6 +22,15 @@ function inspectManifest(file,root,product){
     try{
       const actual=hash(fs.readFileSync(record.target));
       if(actual!==record.originalSha256 && actual!==record.patchedSha256)return null;
+      // Resolve backups relative to their manifest, including former AppData redirection.
+      const marker=path.sep+'backups'+path.sep;
+      const offset=typeof record.backup==='string'?record.backup.lastIndexOf(marker):-1;
+      if(offset>=0){
+        const localRoot=path.join(path.dirname(file),'backups');
+        const localBackup=path.resolve(localRoot,record.backup.slice(offset+marker.length));
+        const relative=path.relative(localRoot,localBackup);
+        if(relative && relative!=='..'&&!relative.startsWith('..'+path.sep)&&!path.isAbsolute(relative)&&fs.existsSync(localBackup))record.backup=localBackup;
+      }
       if(hash(fs.readFileSync(record.backup))!==record.originalSha256)return null;
     }catch{return null;}
   }
@@ -28,7 +38,7 @@ function inspectManifest(file,root,product){
 }
 async function main(){
   const request=readJson(process.argv[2]);
-  if(!request || !['status','apply','restore'].includes(request.action) || !request.appRoot || !request.stateDir)throw new Error('操作请求不完整。');
+  if(!request || !['status','apply','restore','cleanup-preview','cleanup'].includes(request.action) || !request.appRoot || !request.stateDir)throw new Error('操作请求不完整。');
   const root=path.resolve(request.appRoot),state=path.resolve(request.stateDir);
   const product=readJson(path.join(root,'product.json'));
   if(!product)throw new Error('该目录不是有效的 Cursor 安装。请重新选择 Cursor.exe。');
@@ -46,22 +56,48 @@ async function main(){
     }
     const manifestPath=path.join(state,'manifest.json');
     const currentManifest=readJson(manifestPath);
+    if(fs.existsSync(manifestPath)&&!currentManifest)throw new Error('本机备份清单无法读取，已停止操作。');
     if(currentManifest){
       const records=currentManifest.targets || (currentManifest.target?[currentManifest]:[]);
       const expected=['out/vs/workbench/workbench.glass.main.js','out/vs/workbench/workbench.desktop.main.js','product.json'].map(name=>normal(path.join(root,name)));
       if(!records.every(record=>expected.includes(normal(record.target))))throw new Error('本机备份记录属于另一个安装目录，已停止。');
     }
-    let adoptable=null,adoptSource=null;
+    if(request.action==='cleanup-preview'||request.action==='cleanup'){
+      emit({type:'progress',percent:5,message:'检查历史备份与当前还原所需文件'});
+      if(request.action==='cleanup-preview'){
+        const plan=planCleanup(state,currentManifest);
+        emit({type:'result',state:'cleanup-preview',installedVersion:product.version,removableCount:plan.directories.length,removableBytes:plan.bytes,retainedCount:plan.retainedCount,backupDir:state});
+      }else{
+        const result=cleanupBackups(state,currentManifest,(percent,message)=>emit({type:'progress',percent,message}));
+        emit({type:'progress',percent:100,message:'历史备份清理完成，当前还原备份已保留'});
+        emit({type:'result',state:'cleaned',installedVersion:product.version,...result,backupDir:state});
+      }
+      return;
+    }
+    let adoptable=null,adoptSource=null,migratePortable=false;
     if(!currentManifest){
       const exeDirectory=path.resolve(root,'..','..');
-      const candidates=[path.join(path.dirname(exeDirectory),'CursorZhCN','manifest.json'),path.join(process.env.LOCALAPPDATA||state,'CursorZhCN','manifest.json')];
-      for(const file of candidates){const checked=inspectManifest(file,root,product);if(checked){adoptable=checked;adoptSource=file;break;}}
+      const identity=hash(Buffer.from(path.join(exeDirectory,'Cursor.exe').toLowerCase())).slice(0,20);
+      const localAppData=process.env.LOCALAPPDATA||state;
+      const portableCandidates=[path.join(localAppData,'CursorZhCNPortable',identity,'manifest.json')];
+      try{
+        const packages=path.join(localAppData,'Packages');
+        for(const entry of fs.readdirSync(packages,{withFileTypes:true})){
+          if(entry.isDirectory()&&!entry.isSymbolicLink())portableCandidates.push(path.join(packages,entry.name,'LocalCache','Local','CursorZhCNPortable',identity,'manifest.json'));
+        }
+      }catch{}
+      const candidates=[...portableCandidates,path.join(path.dirname(exeDirectory),'CursorZhCN','manifest.json'),path.join(localAppData,'CursorZhCN','manifest.json')];
+      for(const file of candidates){
+        if(normal(path.dirname(file))===normal(state))continue;
+        const checked=inspectManifest(file,root,product);
+        if(checked){adoptable=checked;adoptSource=file;migratePortable=portableCandidates.includes(file);break;}
+      }
     }
-    if(adoptable && request.action==='status'){
+    if(adoptable && request.action==='status' && !migratePortable){
       emit({type:'result',installedVersion:product.version,state:'managed-elsewhere',message:'已注入；检测到可验证的原始备份，可直接接管',backupDir:path.dirname(adoptSource)});return;
     }
     if(adoptable){
-      emit({type:'progress',percent:1,message:'接管已验证的本机原始备份'});
+      emit({type:'progress',percent:1,message:migratePortable?'将已验证的当前备份迁移到用户目录':'接管已验证的本机原始备份'});
       const backupFolder=path.join(state,'backups','adopted-'+product.version+'-'+Date.now());
       fs.mkdirSync(backupFolder,{recursive:true});
       const migrated={...adoptable,targets:adoptable.targets.map(record=>({...record}))};
